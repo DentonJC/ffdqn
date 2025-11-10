@@ -18,12 +18,11 @@ pip install -r requirements.txt
 
 Run experiments:
 ```bash
-python main.py --epochs 500 --trials 5 --lr 0.0007 --lr_rep 0.003 --overlay_type standard --threshold 2
+python main.py --epochs 70 --trials 4 --lr 0.001 --lr_rep 0.0001 --batch_size 128 --eps_start 0.1 --min_buffer 1000 --wd_rep 0 --threshold 2
 ```
 
 Options include:
 - `--method {backprop, hebb, ff, all}` – choose training algorithm  
-- `--env ENV_NAME` – Gym environment (default: `CartPole-v1`)  
 - `--epochs N` – number of training epochs (default: 50)  
 - `--trials N` – independent runs (default: 1)  
 - `--eval_episodes N` – evaluation episodes (default: 50)

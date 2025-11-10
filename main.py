@@ -1,3 +1,4 @@
+import argparse
 import random
 from collections import deque
 
@@ -5,7 +6,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from utils import seed_everything, make_env, handle_reset, handle_step, analyze_results, plot_results, parse_arguments
+
+from utils import (
+    analyze_results,
+    get_epsilon,
+    handle_reset,
+    handle_step,
+    make_env,
+    plot_results,
+    seed_everything,
+)
 
 
 class ReplayBuffer:
@@ -133,7 +143,6 @@ class HebbLayer(nn.Linear):
         )
 
     def train_step(self, x):
-        # x: [B, in_features]
         x_norm = x / (x.norm(p=2, dim=1, keepdim=True) + 1e-8)
         y = self.forward(x_norm)
         B = x_norm.size(0)
@@ -189,7 +198,6 @@ class HebbQNet(nn.Module):
         return self.q_head(h)
 
     def train_representation(self, states):
-        # states: [B, state_dim] tensor on any device
         x = states.to(self.device)
         with torch.no_grad():
             h = x
@@ -241,11 +249,10 @@ class FFLayer(nn.Linear):
         self.train()
         g_pos = self.goodness(x_pos)
         g_neg = self.goodness(x_neg)
-        self.pos_goodness_history.append(g_pos.mean().item())
-        self.neg_goodness_history.append(g_neg.mean().item())
-        pos_loss = torch.relu(self.threshold - g_pos).pow(2).mean()
-        neg_loss = torch.relu(g_neg - self.threshold).pow(2).mean()
-        loss = pos_loss + neg_loss
+
+        loss = torch.log1p(
+            torch.exp(torch.cat([-g_pos + self.threshold, g_neg - self.threshold]))
+        ).mean()
         self.opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
@@ -264,18 +271,16 @@ class FFQNet(nn.Module):
         wd_ff=0.0,
         lr_head=1e-3,
         wd_head=0.0,
-        overlay_type="standard",
         device=None,
     ):
         super().__init__()
         self.device = device or torch.device("cpu")
+        self.state_dim = state_dim
         self.n_actions = n_actions
-        self.overlay_type = overlay_type
 
-        dims = [state_dim + n_actions] + hidden_dims
-        self.layers = nn.ModuleList()
-        for i in range(len(dims) - 1):
-            self.layers.append(
+        dims = [state_dim] + hidden_dims
+        self.layers = nn.ModuleList(
+            [
                 FFLayer(
                     dims[i],
                     dims[i + 1],
@@ -284,72 +289,22 @@ class FFQNet(nn.Module):
                     weight_decay=wd_ff,
                     device=self.device,
                 )
-            )
-
-        # Q-head: scalar Q-value for (s,a) pair
-        self.q_head = nn.Linear(hidden_dims[-1], 1).to(self.device)
-        nn.init.xavier_uniform_(self.q_head.weight)
-        nn.init.zeros_(self.q_head.bias)
-        self.q_opt = AdamW(self.q_head.parameters(), lr=lr_head, weight_decay=wd_head)
+                for i in range(len(dims) - 1)
+            ]
+        )
         self.to(self.device)
+        self.q_head = nn.Linear(hidden_dims[-1], n_actions).to(self.device)
+        self.q_opt = AdamW(self.q_head.parameters(), lr=lr_head, weight_decay=wd_head)
 
-    # ---- FF representation helpers ----
     def _forward_layers(self, x):
-        h = x
+        h = x.to(self.device)
         for layer in self.layers:
             layer.eval()
             h = layer.forward(h)
         return h
 
-    def q_values(self, states):
-        """
-        states: [B, state_dim] -> [B, n_actions]
-        """
-        states = states.to(self.device)
-        B = states.size(0)
-        all_q = []
-        for a in range(self.n_actions):
-            x_in = overlay_action_on_state(states, a, self.n_actions, self.overlay_type)
-            h = self._forward_layers(x_in)
-            q_a = self.q_head(h).view(B)
-            all_q.append(q_a.unsqueeze(1))
-        return torch.cat(all_q, dim=1)
-
-    def get_q_sa(self, states, actions):
-        """
-        For FF labeling / TD-error computation. No gradient needed on FF layers or head.
-        states: [B, state_dim], actions: [B]
-        """
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        with torch.no_grad():
-            x_in = overlay_action_on_state(
-                states, actions, self.n_actions, self.overlay_type
-            )
-            h = self._forward_layers(x_in)
-            q = self.q_head(h).view(-1)
-        return q
-
-    def get_q_sa_for_head(self, states, actions):
-        """
-        For Q-head backprop; FF layers are frozen (no grad).
-        """
-        states = states.to(self.device)
-        actions = actions.to(self.device)
-        with torch.no_grad():
-            x_in = overlay_action_on_state(
-                states, actions, self.n_actions, self.overlay_type
-            )
-            h = self._forward_layers(x_in).detach()
-        q = self.q_head(h).view(-1)
-        return q
-
-    def train_ff_layers(self, pos_inputs, neg_inputs):
-        """
-        pos_inputs, neg_inputs: [N_pos, d_in], [N_neg, d_in]
-        """
-        h_pos = pos_inputs
-        h_neg = neg_inputs
+    def train_ff_layers(self, pos_states, neg_states):
+        h_pos, h_neg = pos_states.to(self.device), neg_states.to(self.device)
         total_loss = 0.0
         for layer in self.layers:
             loss = layer.train_step(h_pos, h_neg)
@@ -366,6 +321,19 @@ class FFQNet(nn.Module):
         with torch.no_grad():
             q = self.q_values(state.unsqueeze(0))[0]
             return q.argmax().item()
+
+    def q_values(self, states):
+        h = self._forward_layers(states)
+        return self.q_head(h)
+
+    def train_q_head(self, states, actions, td_targets):
+        q_vals = self.q_values(states)
+        q_sa = q_vals.gather(1, actions.unsqueeze(1)).squeeze()
+        loss = nn.MSELoss()(q_sa, td_targets)
+        self.q_opt.zero_grad()
+        loss.backward()
+        self.q_opt.step()
+        return loss.item()
 
 
 # ============================================================
@@ -385,11 +353,11 @@ def dqn_update_backprop(
     rewards = torch.tensor(rewards_np, dtype=torch.float32, device=device)
     dones = torch.tensor(dones_np, dtype=torch.float32, device=device)
 
-    q_values = policy_net(states)  # [B, n_actions]
+    q_values = policy_net(states)
     q_sa = q_values.gather(1, actions.unsqueeze(1)).view(-1)
 
     with torch.no_grad():
-        next_q_values = target_net(next_states)  # [B, n_actions]
+        next_q_values = target_net(next_states)
         max_next_q = next_q_values.max(dim=1)[0]
         targets = rewards + gamma * max_next_q * (1.0 - dones)
 
@@ -411,11 +379,9 @@ def dqn_update_hebb(policy_net, target_net, replay_buffer, batch_size, gamma, de
     rewards = torch.tensor(rewards_np, dtype=torch.float32, device=device)
     dones = torch.tensor(dones_np, dtype=torch.float32, device=device)
 
-    # Hebbian representation update (unsupervised)
     policy_net.train_representation(states)
 
-    # DQN on Q-head
-    q_values = policy_net(states)  # [B, n_actions]
+    q_values = policy_net(states)
     q_sa = q_values.gather(1, actions.unsqueeze(1)).view(-1)
 
     with torch.no_grad():
@@ -432,50 +398,38 @@ def dqn_update_hebb(policy_net, target_net, replay_buffer, batch_size, gamma, de
 
 
 def dqn_update_ff(
-    policy_net,
-    target_net,
-    replay_buffer,
-    batch_size,
-    gamma,
-    device,
-    n_actions,
-    overlay_type,
+    policy_net, target_net, replay_buffer, batch_size, gamma, device, n_actions, step
 ):
-    states_np, actions_np, rewards_np, next_states_np, dones_np = replay_buffer.sample(
-        batch_size
-    )
+    states_np, actions_np, rewards_np, next_states_np, dones_np = \
+        replay_buffer.sample(batch_size)
     states = torch.tensor(states_np, dtype=torch.float32, device=device)
     next_states = torch.tensor(next_states_np, dtype=torch.float32, device=device)
     actions = torch.tensor(actions_np, dtype=torch.long, device=device)
     rewards = torch.tensor(rewards_np, dtype=torch.float32, device=device)
     dones = torch.tensor(dones_np, dtype=torch.float32, device=device)
-
-    # 1) Compute TD targets and TD errors using current policy + target
     with torch.no_grad():
-        q_sa = policy_net.get_q_sa(states, actions)  # [B]
-        next_q_values = target_net.q_values(next_states)  # [B, n_actions]
+        next_q_values = target_net.q_values(next_states)
         max_next_q = next_q_values.max(dim=1)[0]
-        targets = rewards + gamma * max_next_q * (1.0 - dones)
-        td_errors = targets - q_sa  # [B]
+        td_targets = rewards + gamma * max_next_q * (1.0 - dones)
+    
+    # 1) Train FF representation
+    if np.random.random() < 0.1:
+        high_reward = td_targets > td_targets.median()
+        low_reward = td_targets <= td_targets.median()
+        if high_reward.sum() > 0 and low_reward.sum() > 0:
+            policy_net.train_ff_layers(
+                states[high_reward],
+                states[low_reward]
+            )
 
-    # 2) FF representation training: label by sign(td_error)
-    overlay_batch = overlay_action_on_state(states, actions, n_actions, overlay_type)
-    pos_mask = td_errors >= 0.0
-    neg_mask = td_errors < 0.0
-    if pos_mask.any() and neg_mask.any():
-        pos_inputs = overlay_batch[pos_mask]
-        neg_inputs = overlay_batch[neg_mask]
-        policy_net.train_ff_layers(pos_inputs, neg_inputs)
-
-    # 3) Q-head DQN training on frozen FF layers
-    q_sa_head = policy_net.get_q_sa_for_head(states, actions)
-    loss = nn.MSELoss()(q_sa_head, targets)
-
-    policy_net.q_opt.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(policy_net.q_head.parameters(), max_norm=1.0)
-    policy_net.q_opt.step()
-    return loss.item()
+    # 2) Standard DQN update on Q-head
+    with torch.no_grad():
+        next_q = target_net.q_values(next_states)
+        max_next_q = next_q.max(dim=1)[0]
+        td_targets = rewards + gamma * max_next_q * (1.0 - dones)
+    
+    loss = policy_net.train_q_head(states, actions, td_targets)
+    return loss
 
 
 # ============================================================
@@ -512,8 +466,8 @@ def train_dqn_backprop(env, state_dim, n_actions, args):
     for trial in range(args.trials):
         seed_everything(args.seed + trial)
         device = args.device
-        policy = DQNNet(state_dim, n_actions, hidden_dims=args.ff_dims, device=device)
-        target = DQNNet(state_dim, n_actions, hidden_dims=args.ff_dims, device=device)
+        policy = DQNNet(state_dim, n_actions, hidden_dims=args.dims, device=device)
+        target = DQNNet(state_dim, n_actions, hidden_dims=args.dims, device=device)
         target.load_state_dict(policy.state_dict())
         optimizer = AdamW(policy.parameters(), lr=args.lr, weight_decay=args.wd_rep)
         replay = ReplayBuffer(args.buffer_size)
@@ -528,7 +482,8 @@ def train_dqn_backprop(env, state_dim, n_actions, args):
                     state_tensor = torch.tensor(
                         state, dtype=torch.float32, device=device
                     )
-                    action = policy.select_action(state_tensor, epsilon=args.epsilon)
+                    eps = get_epsilon(total_steps, args)
+                    action = policy.select_action(state_tensor, epsilon=eps)
                     next_state, reward, done, _ = handle_step(env, action)
                     replay.push(state, action, reward, next_state, done)
                     state = next_state
@@ -584,7 +539,7 @@ def train_dqn_hebb(env, state_dim, n_actions, args):
         policy = HebbQNet(
             state_dim,
             n_actions,
-            hidden_dims=args.hebb_dims,
+            hidden_dims=args.dims,
             lr_rep=args.lr_rep,
             wd_rep=args.wd_rep,
             lr_head=args.lr,
@@ -594,7 +549,7 @@ def train_dqn_hebb(env, state_dim, n_actions, args):
         target = HebbQNet(
             state_dim,
             n_actions,
-            hidden_dims=args.hebb_dims,
+            hidden_dims=args.dims,
             lr_rep=args.lr_rep,
             wd_rep=args.wd_rep,
             lr_head=args.lr,
@@ -614,7 +569,8 @@ def train_dqn_hebb(env, state_dim, n_actions, args):
                     state_tensor = torch.tensor(
                         state, dtype=torch.float32, device=device
                     )
-                    action = policy.select_action(state_tensor, epsilon=args.epsilon)
+                    eps = get_epsilon(total_steps, args)
+                    action = policy.select_action(state_tensor, epsilon=eps)
                     next_state, reward, done, _ = handle_step(env, action)
                     replay.push(state, action, reward, next_state, done)
                     state = next_state
@@ -658,32 +614,32 @@ def train_dqn_hebb(env, state_dim, n_actions, args):
 def train_dqn_ff(env, state_dim, n_actions, args):
     all_epoch_returns = []
     all_eval_rewards = []
-
+    all_peaks = []
     for trial in range(args.trials):
+        peaks = 0
         seed_everything(args.seed + trial)
         device = args.device
         policy = FFQNet(
             state_dim,
             n_actions,
-            hidden_dims=args.ff_dims,
+            hidden_dims=args.dims,
             threshold=args.threshold,
             lr_ff=args.lr_rep,
             wd_ff=args.wd_rep,
             lr_head=args.lr,
             wd_head=args.wd_head,
-            overlay_type=args.overlay_type,
             device=device,
         )
+
         target = FFQNet(
             state_dim,
             n_actions,
-            hidden_dims=args.ff_dims,
+            hidden_dims=args.dims,
             threshold=args.threshold,
             lr_ff=args.lr_rep,
             wd_ff=args.wd_rep,
             lr_head=args.lr,
             wd_head=args.wd_head,
-            overlay_type=args.overlay_type,
             device=device,
         )
         target.load_state_dict(policy.state_dict())
@@ -699,7 +655,8 @@ def train_dqn_ff(env, state_dim, n_actions, args):
                     state_tensor = torch.tensor(
                         state, dtype=torch.float32, device=device
                     )
-                    action = policy.select_action(state_tensor, epsilon=args.epsilon)
+                    eps = get_epsilon(total_steps, args)
+                    action = policy.select_action(state_tensor, epsilon=eps)
                     next_state, reward, done, _ = handle_step(env, action)
                     replay.push(state, action, reward, next_state, done)
                     state = next_state
@@ -718,7 +675,7 @@ def train_dqn_ff(env, state_dim, n_actions, args):
                             args.gamma,
                             device,
                             n_actions,
-                            args.overlay_type,
+                            total_steps
                         )
 
                     if total_steps % args.target_update == 0:
@@ -729,6 +686,8 @@ def train_dqn_ff(env, state_dim, n_actions, args):
                 epoch_rewards.append(ep_reward)
 
             avg_ret = np.mean(epoch_rewards) if epoch_rewards else 0.0
+            if avg_ret > 80:
+                peaks += 1
             all_epoch_returns.append(avg_ret)
             print(f"[FF]       Trial {trial+1}/{args.trials}")
             print("epoch:", epoch + 1)
@@ -741,8 +700,59 @@ def train_dqn_ff(env, state_dim, n_actions, args):
         all_eval_rewards.extend(eval_rewards)
         print("ff_mean:", float(np.mean(eval_rewards)))
         print("ff_std:", float(np.std(eval_rewards)))
+        all_peaks += [peaks]
+        print('peaks:', np.mean(all_peaks))
 
     return policy, all_epoch_returns, all_eval_rewards
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="DQN comparison: Backprop vs Hebbian vs Forward-Forward"
+    )
+
+    # Environment
+    parser.add_argument("--env", type=str, default="CartPole-v1")
+    parser.add_argument("--seed", type=int, default=42)
+
+    # Method selection
+    parser.add_argument(
+        "--method", type=str, default="all", choices=["backprop", "hebb", "ff", "all"]
+    )
+
+    # Training schedule
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--trials", type=int, default=1)
+    parser.add_argument("--episodes_per_epoch", type=int, default=10)
+    parser.add_argument("--max_steps", type=int, default=200)
+    parser.add_argument("--gamma", type=float, default=0.99)
+
+    # Exploration
+    parser.add_argument("--eps_start", type=float, default=0.1)
+    parser.add_argument("--eps_end", type=float, default=0.01)
+    parser.add_argument("--eps_decay_steps", type=int, default=10000)
+
+    # Replay / DQN
+    parser.add_argument("--buffer_size", type=int, default=50000)
+    parser.add_argument("--min_buffer", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--train_freq", type=int, default=1)
+    parser.add_argument("--target_update", type=int, default=1000)
+    parser.add_argument("--eval_episodes", type=int, default=50)
+
+    # Learning rates / weight decay
+    parser.add_argument("--lr", type=float, default=0.3)
+    parser.add_argument("--lr_rep", type=float, default=0.03)
+    parser.add_argument("--wd_rep", type=float, default=0.0)
+    parser.add_argument("--wd_head", type=float, default=0.0)
+
+    # Architecture
+    parser.add_argument("--dims", nargs="+", type=int, default=[128, 64])
+
+    # Forward-Forward specific
+    parser.add_argument("--threshold", type=float, default=2.0)
+
+    return parser.parse_args()
 
 
 def main():

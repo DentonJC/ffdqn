@@ -1,4 +1,3 @@
-import argparse
 import pandas as pd
 import random
 from scipy import stats
@@ -52,12 +51,29 @@ def compute_returns_episode(rewards, gamma=0.99):
 
 
 def smooth_curve(x, window=5):
+    x = np.asarray(x, dtype=np.float32)
+
     if window <= 1 or x.size == 0:
         return x
     if window > x.size:
         window = x.size
+
     kernel = np.ones(window, dtype=np.float32) / float(window)
-    return np.convolve(x, kernel, mode="same")
+
+    # Pad with edge values so the ends are not dragged toward zero
+    left_pad = window // 2
+    right_pad = window - 1 - left_pad
+    x_padded = np.pad(x, (left_pad, right_pad), mode="edge")
+    return np.convolve(x_padded, kernel, mode="valid")
+
+
+
+def get_epsilon(total_steps, args):
+    """Linear decay from eps_start to eps_end over eps_decay_steps."""
+    if total_steps >= args.eps_decay_steps:
+        return args.eps_end
+    frac = total_steps / float(args.eps_decay_steps)
+    return args.eps_start + frac * (args.eps_end - args.eps_start)
 
 
 def analyze_results(training_results, eval_results, eval_episodes_per_trial):
@@ -256,52 +272,4 @@ def plot_results(args, training_results):
     plt.savefig("1.pdf")
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="DQN comparison: Backprop vs Hebbian vs Forward-Forward"
-    )
 
-    # Environment
-    parser.add_argument("--env", type=str, default="CartPole-v1")
-    parser.add_argument("--seed", type=int, default=42)
-
-    # Method selection
-    parser.add_argument(
-        "--method", type=str, default="all", choices=["backprop", "hebb", "ff", "all"]
-    )
-
-    # Training schedule
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--trials", type=int, default=1)
-    parser.add_argument("--episodes_per_epoch", type=int, default=10)
-    parser.add_argument("--max_steps", type=int, default=200)
-    parser.add_argument("--gamma", type=float, default=0.99)
-
-    # Exploration
-    parser.add_argument("--epsilon", type=float, default=0.1)
-
-    # Replay / DQN
-    parser.add_argument("--buffer_size", type=int, default=50000)
-    parser.add_argument("--min_buffer", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--train_freq", type=int, default=1)
-    parser.add_argument("--target_update", type=int, default=1000)
-    parser.add_argument("--eval_episodes", type=int, default=50)
-
-    # Learning rates / weight decay
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--lr_rep", type=float, default=0.03)
-    parser.add_argument("--wd_rep", type=float, default=0.0)
-    parser.add_argument("--wd_head", type=float, default=0.0)
-
-    # Architecture
-    parser.add_argument("--hebb_dims", nargs="+", type=int, default=[128, 64])
-    parser.add_argument("--ff_dims", nargs="+", type=int, default=[128, 64])
-
-    # Forward-Forward specific
-    parser.add_argument("--threshold", type=float, default=2.0)
-    parser.add_argument(
-        "--overlay_type", type=str, choices=["standard", "scaled"], default="scaled"
-    )
-
-    return parser.parse_args()
